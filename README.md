@@ -10,10 +10,6 @@ A tiny macOS app that records a vertical (9:16) region of your screen.
 - Keep the control panel outside the frame while recording, or it will be in the video.
 - The app lives in the **menu bar** (pink `9:16`, turns to `● REC` while recording). Closing the panel (⌘W) only hides it; the app keeps running so ⌘⇧1 keeps working. The menu-bar item shows/hides the frame and panel, starts/stops recording, and has an **Open at Login** toggle. Quit from that menu.
 
-## Microphone audio
-
-macOS's recorder puts the microphone in the left channel of a stereo track and leaves the right channel silent. When *Record Microphone* is on, the app folds the audio to a single mono track after each recording (video is copied, not re-encoded). This needs `ffmpeg` (Homebrew: `brew install ffmpeg`); without it the file is left as recorded.
-
 ## Build
 
 ```bash
