@@ -709,6 +709,7 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
         if FileManager.default.fileExists(atPath: url.path) {
             timeLabel.stringValue = "Saved ✓"
             revealItem.isEnabled = true
+            if micItem.state == .on { makeMono(url) }
         } else {
             timeLabel.stringValue = ""
             let detail = log.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -716,6 +717,43 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
                       (detail.isEmpty ? "" : detail + "\n\n") + "Make sure Record 9:16 is allowed under System Settings → Privacy & Security → Screen & System Audio Recording, then try again.",
                       settings: true)
         }
+    }
+
+    // MARK: Mono audio
+
+    private func ffmpegPath() -> String? {
+        for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
+        where FileManager.default.isExecutableFile(atPath: p) { return p }
+        return nil
+    }
+
+    /// screencapture puts the microphone in the left channel of a stereo track (right stays silent).
+    /// Fold both channels into one mono track; video is copied untouched.
+    private func makeMono(_ url: URL) {
+        guard let ff = ffmpegPath() else { logLine("ffmpeg not found; audio left as recorded (stereo, mic in left)"); return }
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(".mono-" + url.lastPathComponent)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ff)
+        p.arguments = ["-y", "-v", "error", "-i", url.path, "-map", "0", "-c:v", "copy",
+                       "-c:a", "aac", "-b:a", "192k", "-af", "pan=mono|c0=c0+c1",
+                       "-movflags", "+faststart", tmp.path]
+        let pipe = Pipe(); p.standardError = pipe; p.standardOutput = pipe
+        timeLabel.stringValue = "Audio…"
+        p.terminationHandler = { proc in
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let status = proc.terminationStatus
+            Task { @MainActor in
+                if status == 0 {
+                    do { _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp); logLine("audio folded to mono") }
+                    catch { logLine("couldn't replace file after mono conversion: \(error)") }
+                } else {
+                    logLine("mono conversion failed (\(status)): \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+                }
+                try? FileManager.default.removeItem(at: tmp)
+                self.timeLabel.stringValue = "Saved ✓"
+            }
+        }
+        do { try p.run() } catch { logLine("couldn't run ffmpeg: \(error)") }
     }
 
     // Closing the panel hides it; the app stays in the menu bar so the hotkey keeps working.
