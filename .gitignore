@@ -1,0 +1,6 @@
+# Build output (run ./build.sh)
+Record 9:16.app/
+
+# Logs and local files
+*.log
+.DS_Store
