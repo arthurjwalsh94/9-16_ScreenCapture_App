@@ -706,14 +706,15 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
         setRecordTitle("Record")
         recordButton.fill = .mzHotPink
         updateStatusItem()
-        showUI()   // bring the toolbar back so the result is visible
         timeLabel.textColor = .secondaryLabelColor
 
         if FileManager.default.fileExists(atPath: url.path) {
             timeLabel.stringValue = "Saved ✓"
             revealItem.isEnabled = true
             if micItem.state == .on && monoItem.state == .on { makeMono(url) }
+            hideUI()   // out of the way until the next \(HOTKEY_LABEL) or menu-bar click
         } else {
+            showUI()
             timeLabel.stringValue = ""
             let detail = log.trimmingCharacters(in: .whitespacesAndNewlines)
             showAlert("No video was saved",
