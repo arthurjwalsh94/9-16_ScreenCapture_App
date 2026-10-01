@@ -12,6 +12,8 @@ A tiny macOS app that records a vertical (9:16) region of your screen.
 
 ## Microphone audio
 
+Pick the input under **Options → Microphone** (your interface, the MacBook mic, an iPhone, or System Default). The list refreshes each time the menu opens, and the choice is remembered. If the chosen input isn't connected when you record, the system default is used.
+
 macOS's recorder puts the microphone in the left channel of a stereo track; the right channel carries whatever is on the interface's second input. With *Record Microphone* on, the **Mic to Mono (Left Channel Only)** option (on by default) keeps just the left channel as a mono track after each recording. The video is copied, not re-encoded, and the right channel is discarded entirely. Needs `ffmpeg` (`brew install ffmpeg`); without it the file is left as recorded.
 
 ## Build

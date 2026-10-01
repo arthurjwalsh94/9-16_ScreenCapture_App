@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
 import ServiceManagement
 
@@ -180,7 +181,7 @@ final class FrameView: NSView {
 // MARK: - Controller (region model + control panel + recording)
 
 @MainActor
-final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSMenuDelegate {
     private(set) var region = NSRect.zero        // recorded region, global AppKit coords (points, bottom-left origin)
 
     let overlay: OverlayWindow
@@ -196,6 +197,8 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
     let cursorItem = NSMenuItem(title: "Show Mouse Pointer", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let clicksItem = NSMenuItem(title: "Show Mouse Clicks", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let micItem = NSMenuItem(title: "Record Microphone", action: #selector(toggleOption(_:)), keyEquivalent: "")
+    let micDeviceItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+    let micMenu = NSMenu()
     let monoItem = NSMenuItem(title: "Mic to Mono (Left Channel Only)", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let hideFrameItem = NSMenuItem(title: "Hide Frame While Recording", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let folderItem = NSMenuItem(title: "Save To…", action: #selector(chooseFolder), keyEquivalent: "")
@@ -462,7 +465,13 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
         for it in [cursorItem, clicksItem, micItem, monoItem, hideFrameItem, folderItem, revealItem] { it.target = self }
         revealItem.isEnabled = false
         om.autoenablesItems = false
-        om.addItem(cursorItem); om.addItem(clicksItem); om.addItem(micItem); om.addItem(monoItem)
+        micMenu.delegate = self
+        micMenu.autoenablesItems = false
+        micDeviceItem.submenu = micMenu
+        refreshMicMenu()
+        om.addItem(cursorItem); om.addItem(clicksItem)
+        om.addItem(.separator())
+        om.addItem(micItem); om.addItem(micDeviceItem); om.addItem(monoItem)
         om.addItem(.separator())
         om.addItem(hideFrameItem)
         om.addItem(.separator())
@@ -552,6 +561,54 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
         if a.runModal() == .alertSecondButtonReturn { openSettings() }
     }
 
+    // MARK: Microphone choice
+
+    /// The chosen input's unique ID, or nil for the system default.
+    var selectedMicUID: String? {
+        let v = UserDefaults.standard.string(forKey: "micDeviceUID") ?? ""
+        return v.isEmpty ? nil : v
+    }
+
+    func micDevices() -> [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified)
+            .devices.sorted { $0.localizedName.localizedCaseInsensitiveCompare($1.localizedName) == .orderedAscending }
+    }
+
+    /// Rebuilt each time the submenu opens so newly plugged-in inputs show up.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === micMenu { refreshMicMenu() }
+    }
+
+    private func refreshMicMenu() {
+        let devices = micDevices()
+        let uid = selectedMicUID
+        micMenu.removeAllItems()
+        let def = NSMenuItem(title: "System Default", action: #selector(pickMic(_:)), keyEquivalent: "")
+        def.target = self; def.representedObject = ""; def.state = uid == nil ? .on : .off
+        micMenu.addItem(def)
+        micMenu.addItem(.separator())
+        for d in devices {
+            let it = NSMenuItem(title: d.localizedName, action: #selector(pickMic(_:)), keyEquivalent: "")
+            it.target = self; it.representedObject = d.uniqueID; it.state = d.uniqueID == uid ? .on : .off
+            micMenu.addItem(it)
+        }
+        if let uid, !devices.contains(where: { $0.uniqueID == uid }) {
+            let missing = NSMenuItem(title: "Chosen input not connected (default will be used)", action: nil, keyEquivalent: "")
+            missing.isEnabled = false
+            micMenu.addItem(.separator()); micMenu.addItem(missing)
+        }
+        let name = uid.flatMap { u in devices.first { $0.uniqueID == u }?.localizedName } ?? "System Default"
+        micDeviceItem.title = "Microphone: \(name)"
+    }
+
+    @objc private func pickMic(_ sender: NSMenuItem) {
+        UserDefaults.standard.set((sender.representedObject as? String) ?? "", forKey: "micDeviceUID")
+        // Choosing an input means you want it recorded.
+        micItem.state = .on
+        UserDefaults.standard.set(true, forKey: "recordMic")
+        refreshMicMenu()
+    }
+
     @objc private func toggleOption(_ sender: NSMenuItem) {
         sender.state = sender.state == .on ? .off : .on
         if let key = sender.representedObject as? String { UserDefaults.standard.set(sender.state == .on, forKey: key) }
@@ -638,7 +695,15 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate 
         var args = ["-v", "-x", "-R", "\(r.x),\(r.y),\(r.w),\(r.h)"]
         if cursorItem.state == .on { args.append("-C") }
         if clicksItem.state == .on { args.append("-k") }
-        if micItem.state == .on { args.append("-g") }
+        if micItem.state == .on {
+            // -G<id> records from a specific input; -g uses the system default.
+            if let uid = selectedMicUID, micDevices().contains(where: { $0.uniqueID == uid }) {
+                args.append("-G\(uid)")
+            } else {
+                if selectedMicUID != nil { logLine("chosen microphone not connected; using system default") }
+                args.append("-g")
+            }
+        }
         args.append(url.path)
 
         let p = Process()
