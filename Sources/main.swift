@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CoreAudio
 import Carbon.HIToolbox
 import ServiceManagement
 
@@ -22,6 +23,113 @@ extension NSColor {
 let HOTKEY_KEYCODE = UInt32(kVK_ANSI_1)
 let HOTKEY_MODIFIERS = UInt32(cmdKey | shiftKey)
 let HOTKEY_LABEL = "⌘⇧1"
+
+/// CoreAudio lookups for input devices (UIDs match AVCaptureDevice.uniqueID).
+enum AudioInputs {
+    private static func get<T>(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope, _ v: inout T) -> Bool {
+        var a = AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr
+    }
+    static func uid(of dev: AudioDeviceID) -> String? {
+        var u: Unmanaged<CFString>?
+        guard get(dev, kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, &u), let u else { return nil }
+        return u.takeRetainedValue() as String
+    }
+    /// UID of the Mac's current input device (System Settings > Sound > Input).
+    static func defaultInputUID() -> String? {
+        var dev = AudioDeviceID(0)
+        guard get(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, &dev) else { return nil }
+        return uid(of: dev)
+    }
+    static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(sys, &a, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(sys, &a, 0, nil, &size, &ids) == noErr else { return nil }
+        return ids.first { self.uid(of: $0) == uid }
+    }
+    /// Number of input channels the device exposes (0 if unknown).
+    static func inputChannels(uid: String) -> Int {
+        guard let dev = deviceID(forUID: uid) else { return 0 }
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(dev, &a, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { buf.deallocate() }
+        guard AudioObjectGetPropertyData(dev, &a, 0, nil, &size, buf) == noErr else { return 0 }
+        return UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self)).reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+}
+
+/// Records ONE channel of an input device to a mono WAV, natively.
+///
+/// macOS's `screencapture -g/-G` intermittently writes full-scale static for multichannel
+/// interfaces (measured: a 22-input interface was garbage in 5 of 6 captures while this
+/// path was clean every time), so the app records the microphone itself.
+final class MicRecorder: @unchecked Sendable {
+    let url: URL
+    private let engine = AVAudioEngine()
+    private var file: AVAudioFile?
+    private var frames: AVAudioFramePosition = 0
+    private var sampleRate: Double = 48_000
+    private var running = false
+    private(set) var channelUsed = 1
+
+    init(url: URL) { self.url = url }
+
+    /// `deviceUID` nil = the Mac's input device. `channel` is zero-based.
+    func start(deviceUID: String?, channel: Int) throws {
+        let input = engine.inputNode
+        if let uid = deviceUID, var dev = AudioInputs.deviceID(forUID: uid), let au = input.audioUnit {
+            let err = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                           &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+            if err != noErr {
+                throw NSError(domain: "Record916", code: Int(err), userInfo: [NSLocalizedDescriptionKey: "Couldn't select that input device (error \(err))."])
+            }
+        }
+        let fmt = input.outputFormat(forBus: 0)
+        guard fmt.channelCount > 0, fmt.sampleRate > 0 else {
+            throw NSError(domain: "Record916", code: 1, userInfo: [NSLocalizedDescriptionKey: "The input device has no usable channels."])
+        }
+        let ch = min(max(channel, 0), Int(fmt.channelCount) - 1)
+        channelUsed = ch + 1
+        sampleRate = fmt.sampleRate
+        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: fmt.sampleRate, channels: 1, interleaved: false) else {
+            throw NSError(domain: "Record916", code: 2, userInfo: [NSLocalizedDescriptionKey: "Couldn't create the audio format."])
+        }
+        let f = try AVAudioFile(forWriting: url,
+                                settings: [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: fmt.sampleRate,
+                                           AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 24, AVLinearPCMIsFloatKey: false],
+                                commonFormat: .pcmFormatFloat32, interleaved: false)
+        file = f
+        input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buf, _ in
+            guard let self, let src = buf.floatChannelData,
+                  let out = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: buf.frameLength),
+                  let dst = out.floatChannelData else { return }
+            out.frameLength = buf.frameLength
+            memcpy(dst[0], src[ch], Int(buf.frameLength) * MemoryLayout<Float>.size)
+            if (try? f.write(from: out)) != nil { self.frames += AVAudioFramePosition(buf.frameLength) }
+        }
+        engine.prepare()
+        try engine.start()
+        running = true
+    }
+
+    /// Stops (idempotent) and returns the recorded duration in seconds.
+    @discardableResult
+    func stop() -> Double {
+        if running {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            file = nil      // closes the WAV
+            running = false
+        }
+        return Double(frames) / sampleRate
+    }
+}
 
 /// Appends to ~/Library/Logs/Record916.log (and NSLog) so failures can be diagnosed.
 func logLine(_ msg: String) {
@@ -199,7 +307,10 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
     let micItem = NSMenuItem(title: "Record Microphone", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let micDeviceItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
     let micMenu = NSMenu()
-    let monoItem = NSMenuItem(title: "Mic to Mono (Left Channel Only)", action: #selector(toggleOption(_:)), keyEquivalent: "")
+    let channelItem = NSMenuItem(title: "Input Channel", action: nil, keyEquivalent: "")
+    let channelMenu = NSMenu()
+    private var mic: MicRecorder?
+    private var micDuration: Double = 0
     let hideFrameItem = NSMenuItem(title: "Hide Frame While Recording", action: #selector(toggleOption(_:)), keyEquivalent: "")
     let folderItem = NSMenuItem(title: "Save To…", action: #selector(chooseFolder), keyEquivalent: "")
     let revealItem = NSMenuItem(title: "Show Last Recording in Finder", action: #selector(reveal), keyEquivalent: "")
@@ -458,20 +569,23 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         clicksItem.state = optionValue("showClicks", default: false) ? .on : .off
         micItem.state = optionValue("recordMic", default: false) ? .on : .off
         hideFrameItem.state = optionValue("hideFrame", default: true) ? .on : .off
-        monoItem.state = optionValue("monoMic", default: true) ? .on : .off
-        monoItem.representedObject = "monoMic"
         cursorItem.representedObject = "showCursor"; clicksItem.representedObject = "showClicks"
         micItem.representedObject = "recordMic"; hideFrameItem.representedObject = "hideFrame"
-        for it in [cursorItem, clicksItem, micItem, monoItem, hideFrameItem, folderItem, revealItem] { it.target = self }
+        for it in [cursorItem, clicksItem, micItem, hideFrameItem, folderItem, revealItem] { it.target = self }
         revealItem.isEnabled = false
         om.autoenablesItems = false
         micMenu.delegate = self
         micMenu.autoenablesItems = false
         micDeviceItem.submenu = micMenu
+        channelMenu.delegate = self
+        channelMenu.autoenablesItems = false
+        channelItem.submenu = channelMenu
+        om.delegate = self
         refreshMicMenu()
+        refreshChannelMenu()
         om.addItem(cursorItem); om.addItem(clicksItem)
         om.addItem(.separator())
-        om.addItem(micItem); om.addItem(micDeviceItem); om.addItem(monoItem)
+        om.addItem(micItem); om.addItem(micDeviceItem); om.addItem(channelItem)
         om.addItem(.separator())
         om.addItem(hideFrameItem)
         om.addItem(.separator())
@@ -551,14 +665,19 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         for c in [presetControl, widthField, heightField, optionsButton] as [NSControl] { c.isEnabled = on }
     }
 
-    private func showAlert(_ title: String, _ text: String, settings: Bool = false) {
+    private func showAlert(_ title: String, _ text: String, settings: Bool = false, micSettings: Bool = false) {
         let a = NSAlert()
         a.messageText = title
         a.informativeText = text
         a.addButton(withTitle: "OK")
         if settings { a.addButton(withTitle: "Open Screen Recording Settings") }
+        else if micSettings { a.addButton(withTitle: "Open Microphone Settings") }
         NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertSecondButtonReturn { openSettings() }
+        if a.runModal() == .alertSecondButtonReturn {
+            if micSettings, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                NSWorkspace.shared.open(u)
+            } else { openSettings() }
+        }
     }
 
     // MARK: Microphone choice
@@ -574,16 +693,67 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
             .devices.sorted { $0.localizedName.localizedCaseInsensitiveCompare($1.localizedName) == .orderedAscending }
     }
 
+    /// The chosen input if it is connected, otherwise nil (the Mac's input device).
+    private func resolvedMicUID() -> String? {
+        guard let uid = selectedMicUID, micDevices().contains(where: { $0.uniqueID == uid }) else { return nil }
+        return uid
+    }
+
+    /// 1-based channel of the input device to record.
+    var selectedChannel: Int { max(1, UserDefaults.standard.integer(forKey: "micChannel")) }
+
+    private func refreshChannelMenu() {
+        let uid = resolvedMicUID() ?? AudioInputs.defaultInputUID()
+        let count = max(1, min(uid.map { AudioInputs.inputChannels(uid: $0) } ?? 1, 32))
+        let current = min(selectedChannel, count)
+        channelMenu.removeAllItems()
+        for c in 1...count {
+            let it = NSMenuItem(title: "Channel \(c)", action: #selector(pickChannel(_:)), keyEquivalent: "")
+            it.target = self; it.tag = c; it.state = c == current ? .on : .off
+            channelMenu.addItem(it)
+        }
+        channelItem.title = "Input Channel: \(current)"
+    }
+
+    @objc private func pickChannel(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.tag, forKey: "micChannel")
+        micItem.state = .on
+        UserDefaults.standard.set(true, forKey: "recordMic")
+        refreshChannelMenu()
+    }
+
+    private func ensureMicAccess() -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { ok in
+                Task { @MainActor in if ok { self.startRecording() } }
+            }
+            return false
+        default:
+            showUI()
+            showAlert("Microphone permission needed",
+                      "Turn on Record 9:16 under System Settings → Privacy & Security → Microphone, then record again.",
+                      micSettings: true)
+            return false
+        }
+    }
+
     /// Rebuilt each time the submenu opens so newly plugged-in inputs show up.
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === micMenu { refreshMicMenu() }
+        else if menu === channelMenu { refreshChannelMenu() }
+        else if menu === optionsButton.menu { refreshMicMenu(); refreshChannelMenu() }
     }
 
     private func refreshMicMenu() {
         let devices = micDevices()
         let uid = selectedMicUID
         micMenu.removeAllItems()
-        let def = NSMenuItem(title: "System Default", action: #selector(pickMic(_:)), keyEquivalent: "")
+        let defUID = AudioInputs.defaultInputUID()
+        let defName = devices.first { $0.uniqueID == defUID }?.localizedName
+        let def = NSMenuItem(title: "System Default" + (defName.map { " (\($0))" } ?? ""), action: #selector(pickMic(_:)), keyEquivalent: "")
         def.target = self; def.representedObject = ""; def.state = uid == nil ? .on : .off
         micMenu.addItem(def)
         micMenu.addItem(.separator())
@@ -597,7 +767,7 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
             missing.isEnabled = false
             micMenu.addItem(.separator()); micMenu.addItem(missing)
         }
-        let name = uid.flatMap { u in devices.first { $0.uniqueID == u }?.localizedName } ?? "System Default"
+        let name = uid.flatMap { u in devices.first { $0.uniqueID == u }?.localizedName } ?? ("System Default" + (defName.map { " (\($0))" } ?? ""))
         micDeviceItem.title = "Microphone: \(name)"
     }
 
@@ -607,6 +777,7 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         micItem.state = .on
         UserDefaults.standard.set(true, forKey: "recordMic")
         refreshMicMenu()
+        refreshChannelMenu()
     }
 
     @objc private func toggleOption(_ sender: NSMenuItem) {
@@ -695,16 +866,24 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         var args = ["-v", "-x", "-R", "\(r.x),\(r.y),\(r.w),\(r.h)"]
         if cursorItem.state == .on { args.append("-C") }
         if clicksItem.state == .on { args.append("-k") }
-        if micItem.state == .on {
-            // -G<id> records from a specific input; -g uses the system default.
-            if let uid = selectedMicUID, micDevices().contains(where: { $0.uniqueID == uid }) {
-                args.append("-G\(uid)")
-            } else {
-                if selectedMicUID != nil { logLine("chosen microphone not connected; using system default") }
-                args.append("-g")
-            }
-        }
         args.append(url.path)
+
+        // The microphone is recorded by the app itself (mono, one channel); screencapture does video only.
+        var micRec: MicRecorder?
+        if micItem.state == .on {
+            guard ensureMicAccess() else { return }
+            let wav = FileManager.default.temporaryDirectory.appendingPathComponent("record916-mic-\(UUID().uuidString).wav")
+            let r = MicRecorder(url: wav)
+            do {
+                try r.start(deviceUID: resolvedMicUID(), channel: selectedChannel - 1)
+                logLine("microphone started: \(micDeviceItem.title), channel \(r.channelUsed)")
+            } catch {
+                showUI()
+                showAlert("Couldn't start the microphone", error.localizedDescription)
+                return
+            }
+            micRec = r
+        }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -720,10 +899,14 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         }
         logLine("starting screencapture " + args.joined(separator: " "))
         do { try p.run() } catch {
+            micRec?.stop()
+            if let m = micRec { try? FileManager.default.removeItem(at: m.url) }
             showAlert("Couldn't start recording", error.localizedDescription)
             return
         }
 
+        mic = micRec
+        micDuration = 0
         process = p
         lastFile = url
         startDate = Date()
@@ -743,14 +926,22 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         guard let p = process else { return }
         timeLabel.stringValue = "Saving…"
         recordButton.isEnabled = false
+        if let m = mic { micDuration = m.stop() }   // audio and video stop together
         p.interrupt()   // SIGINT: screencapture finalises the movie
     }
 
     /// Called on quit: stop and wait so the file is finalised.
     func stopAndWait() {
         guard let p = process else { return }
+        let m = mic
+        if let m { micDuration = m.stop() }
+        mic = nil
+        p.terminationHandler = nil
         p.interrupt()
         p.waitUntilExit()
+        if let m, let url = lastFile, FileManager.default.fileExists(atPath: url.path) {
+            muxMic(video: url, audio: m.url, audioDuration: micDuration, wait: true)
+        }
     }
 
     @objc private func tick() {
@@ -772,13 +963,17 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         recordButton.fill = .mzHotPink
         updateStatusItem()
         timeLabel.textColor = .secondaryLabelColor
+        let m = mic
+        if let m { micDuration = m.stop() }   // no-op if already stopped
+        mic = nil
 
         if FileManager.default.fileExists(atPath: url.path) {
             timeLabel.stringValue = "Saved ✓"
             revealItem.isEnabled = true
-            if micItem.state == .on && monoItem.state == .on { makeMono(url) }
+            if let m { muxMic(video: url, audio: m.url, audioDuration: micDuration) }
             hideUI()   // out of the way until the next \(HOTKEY_LABEL) or menu-bar click
         } else {
+            if let m { try? FileManager.default.removeItem(at: m.url) }
             showUI()
             timeLabel.stringValue = ""
             let detail = log.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -788,7 +983,7 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         }
     }
 
-    // MARK: Mono microphone audio
+    // MARK: Joining the microphone track to the video
 
     private func ffmpegPath() -> String? {
         for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
@@ -796,30 +991,59 @@ final class RecorderController: NSObject, NSWindowDelegate, NSTextFieldDelegate,
         return nil
     }
 
-    /// screencapture writes the microphone into the LEFT channel of a stereo track; the right
-    /// channel is whatever is on the interface's second input. Keep only the left channel as a
-    /// mono track. The video stream is copied untouched.
-    private func makeMono(_ url: URL) {
-        guard let ff = ffmpegPath() else { logLine("ffmpeg not found; audio left as recorded"); return }
-        let tmp = url.deletingLastPathComponent().appendingPathComponent(".mono-" + url.lastPathComponent)
+    /// Adds the natively recorded mono microphone track to the screen recording. The video
+    /// stream is copied untouched; only the WAV is encoded (AAC).
+    ///
+    /// Sync: audio starts just before the video does, and both stop together, so any extra
+    /// audio length is lead-in from before the first video frame and is trimmed off the start.
+    private func muxMic(video: URL, audio: URL, audioDuration: Double, wait: Bool = false) {
+        guard let ff = ffmpegPath() else {
+            let side = video.deletingPathExtension().appendingPathExtension("wav")
+            try? FileManager.default.moveItem(at: audio, to: side)
+            logLine("ffmpeg not found; microphone saved separately as \(side.lastPathComponent)")
+            return
+        }
+        let videoDuration = CMTimeGetSeconds(AVURLAsset(url: video).duration)
+        var lead = (videoDuration.isFinite && videoDuration > 0) ? audioDuration - videoDuration : 0
+        if lead < -2 || lead > 5 { logLine("unexpected audio lead \(lead)s; not shifting"); lead = 0 }
+        let tmp = video.deletingLastPathComponent().appendingPathComponent(".mux-" + video.lastPathComponent)
+        var args = ["-y", "-v", "error", "-i", video.path]
+        if lead > 0 { args += ["-ss", String(format: "%.3f", lead)] }
+        else if lead < 0 { args += ["-itsoffset", String(format: "%.3f", -lead)] }
+        args += ["-i", audio.path, "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                 "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", tmp.path]
         let p = Process()
         p.executableURL = URL(fileURLWithPath: ff)
-        p.arguments = ["-y", "-v", "error", "-i", url.path, "-map", "0", "-c:v", "copy",
-                       "-c:a", "aac", "-b:a", "192k", "-af", "pan=mono|c0=c0",
-                       "-movflags", "+faststart", tmp.path]
+        p.arguments = args
         let pipe = Pipe(); p.standardError = pipe; p.standardOutput = pipe
+        logLine(String(format: "joining mic track (audio %.2fs, video %.2fs, lead %.3fs)", audioDuration, videoDuration, lead))
+
+        let finish: @Sendable (Int32, String) -> Void = { status, out in
+            if status == 0 {
+                do { _ = try FileManager.default.replaceItemAt(video, withItemAt: tmp); logLine("microphone track added (mono)") }
+                catch { logLine("couldn't replace file after adding microphone: \(error)") }
+                try? FileManager.default.removeItem(at: audio)
+            } else {
+                // Keep the audio rather than lose it.
+                let side = video.deletingPathExtension().appendingPathExtension("wav")
+                try? FileManager.default.moveItem(at: audio, to: side)
+                logLine("adding microphone failed (\(status)): \(out.trimmingCharacters(in: .whitespacesAndNewlines)); audio kept as \(side.lastPathComponent)")
+            }
+            try? FileManager.default.removeItem(at: tmp)
+        }
+
+        if wait {
+            do { try p.run() } catch { logLine("couldn't run ffmpeg: \(error)"); return }
+            p.waitUntilExit()
+            finish(p.terminationStatus, String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            return
+        }
         timeLabel.stringValue = "Audio…"
         p.terminationHandler = { proc in
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             let status = proc.terminationStatus
             Task { @MainActor in
-                if status == 0 {
-                    do { _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp); logLine("mic audio folded to mono (left channel only)") }
-                    catch { logLine("couldn't replace file after mono conversion: \(error)") }
-                } else {
-                    logLine("mono conversion failed (\(status)): \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
-                }
-                try? FileManager.default.removeItem(at: tmp)
+                finish(status, out)
                 self.timeLabel.stringValue = "Saved ✓"
             }
         }

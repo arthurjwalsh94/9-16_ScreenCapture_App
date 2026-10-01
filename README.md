@@ -4,7 +4,7 @@ A tiny macOS app that records a vertical (9:16) region of your screen.
 
 - A hot-pink frame (Marzelle `#FF007D`) floats over everything. **Click anywhere inside it and drag** to position, **drag the bottom-right corner** to resize. Arrow keys nudge it (Shift = 10 pt).
 - The frame is always exactly 9:16. Widths snap to 18-pixel steps so both sides stay whole, even numbers (1080×1920, 720×1280, 540×960 …).
-- A floating toolbar (styled like the macOS screenshot bar) sits at the bottom of the screen: size presets, editable width and height in pixels (the other side follows), an **Options** menu (mouse pointer, clicks, microphone, hide frame while recording, save folder, reveal last recording) and a pink **Record** button. Drag the bar anywhere; the × hides it.
+- A floating toolbar (styled like the macOS screenshot bar) sits at the bottom of the screen: size presets, editable width and height in pixels (the other side follows), an **Options** menu (mouse pointer, clicks, microphone with input and channel choice, hide frame while recording, save folder, reveal last recording) and a pink **Record** button. Drag the bar anywhere; the × hides it.
 - **Record** starts, **Stop** finishes, and the frame and toolbar hide themselves once the file is saved (⌘⇧1 or the menu-bar item brings them back). **⌘⇧1** works from any app: if the frame is hidden it shows it so you can position it; if the frame is visible it starts recording; while recording it stops. (Change `HOTKEY_KEYCODE` / `HOTKEY_MODIFIERS` in `main.swift`.) ⌘R toggles recording directly when the app is active. Files land on the Desktop (change with *Folder…*) as `Screen Recording 9x16 <date>.mov` (H.264).
 - Options: show cursor, show clicks, record microphone, hide the frame while recording. The frame is drawn *outside* the recorded area, so it never appears in the video either way.
 - Keep the control panel outside the frame while recording, or it will be in the video.
@@ -12,9 +12,15 @@ A tiny macOS app that records a vertical (9:16) region of your screen.
 
 ## Microphone audio
 
-Pick the input under **Options → Microphone** (your interface, the MacBook mic, an iPhone, or System Default). The list refreshes each time the menu opens, and the choice is remembered. If the chosen input isn't connected when you record, the system default is used.
+The app records the microphone itself and joins it to the video afterwards; macOS's recorder is used for video only. (Its own microphone path, `screencapture -g/-G`, intermittently writes full-scale static for multichannel interfaces: with a 22-input interface it was garbage in 5 of 6 test captures while the native path was clean every time.)
 
-macOS's recorder puts the microphone in the left channel of a stereo track; the right channel carries whatever is on the interface's second input. With *Record Microphone* on, the **Mic to Mono (Left Channel Only)** option (on by default) keeps just the left channel as a mono track after each recording. The video is copied, not re-encoded, and the right channel is discarded entirely. Needs `ffmpeg` (`brew install ffmpeg`); without it the file is left as recorded.
+- **Options → Record Microphone** turns audio on.
+- **Options → Microphone** picks the input (an interface, the MacBook mic, an iPhone, or System Default). The list refreshes each time the menu opens.
+- **Options → Input Channel** picks which channel of that input to record, for interfaces with several inputs. Default is channel 1.
+- The result is a single **mono** track from that one channel. Other channels are never touched.
+- The video stream is copied, not re-encoded. Audio and video are aligned automatically: the audio starts slightly before the first video frame and both stop together, so the extra lead-in is trimmed.
+- Joining needs `ffmpeg` (`brew install ffmpeg`). Without it the microphone is saved next to the video as a `.wav`.
+- macOS asks for Microphone permission the first time.
 
 ## Build
 
